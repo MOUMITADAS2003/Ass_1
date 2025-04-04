@@ -1,56 +1,68 @@
-# Ass_1
-Assigment_1
-from transformers import pipeline, Conversation
+from transformers import pipeline
 
-# Load the conversational pipeline
-chat_pipeline = pipeline("conversational", model="microsoft/DialoGPT-medium")
+# Load sentiment-analysis pipeline
+classifier = pipeline("sentiment-analysis")
 
-def get_response(user_input: str) -> str:
-    convo = Conversation(user_input)
-    response = chat_pipeline(convo)
-    return response.generated_responses[-1]
-import sqlite3
+def analyze_sentiment(text):
+    result = classifier(text)[0]
+    return {
+        "label": result["label"],  # POSITIVE or NEGATIVE
+        "score": round(result["score"], 3)
+    }
+from pymongo import MongoClient
 from datetime import datetime
 
-DB_NAME = "chatbot.db"
+client = MongoClient("mongodb://localhost:27017/")
+db = client["sentiment_db"]
+collection = db["reviews"]
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            user_input TEXT,
-            bot_response TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+def log_review(text, sentiment):
+    document = {
+        "text": text,
+        "sentiment": sentiment["label"],
+        "score": sentiment["score"],
+        "timestamp": datetime.utcnow()
+    }
+    collection.insert_one(document)
 
-def log_interaction(user_input: str, bot_response: str):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO logs (timestamp, user_input, bot_response)
-        VALUES (?, ?, ?)
-    ''', (datetime.now().isoformat(), user_input, bot_response))
-    conn.commit()
-    conn.close()
-from fastapi import FastAPI
-from pydantic import BaseModel
-from chatbot import get_response
-from database import init_db, log_interaction
+def get_sentiment_counts():
+    return list(collection.aggregate([
+        {"$group": {"_id": "$sentiment", "count": {"$sum": 1}}}
+    ]))
+import matplotlib.pyplot as plt
+from database import get_sentiment_counts
 
-app = FastAPI()
-init_db()
+def plot_sentiment_distribution():
+    data = get_sentiment_counts()
+    labels = [d["_id"] for d in data]
+    counts = [d["count"] for d in data]
 
-class Message(BaseModel):
-    user_input: str
+    plt.figure(figsize=(6, 4))
+    plt.bar(labels, counts, color=["green", "red", "gray"])
+    plt.title("Sentiment Distribution")
+    plt.xlabel("Sentiment")
+    plt.ylabel("Number of Reviews")
+    plt.tight_layout()
+    plt.savefig("sentiment_report.png")
+from flask import Flask, request, jsonify, send_file
+from sentiment import analyze_sentiment
+from database import log_review
+from visualize import plot_sentiment_distribution
 
-@app.post("/chat")
-async def chat(message: Message):
-    user_input = message.user_input
-    bot_response = get_response(user_input)
-    log_interaction(user_input, bot_response)
-    return {"response": bot_response}
+app = Flask(__name__)
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    data = request.json
+    text = data.get("text")
+    result = analyze_sentiment(text)
+    log_review(text, result)
+    return jsonify(result)
+
+@app.route("/report", methods=["GET"])
+def report():
+    plot_sentiment_distribution()
+    return send_file("sentiment_report.png", mimetype='image/png')
+
+if __name__ == "__main__":
+    app.run(debug=True)
